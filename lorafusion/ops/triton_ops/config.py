@@ -125,11 +125,53 @@ RTX3090_CONFIG = HardwareConfig(
     fused_multi_lora_dys_dyb=LoRATritonConfig(64, None, 128, 8, 3, 8),
 )
 
+H200_CONFIG = HardwareConfig(
+    fused_lora_xw_sb=LoRATritonConfig(128, 256, 64, 8, 3, 8),
+    fused_lora_dyw_dsa=LoRATritonConfig(128, 256, 64, 8, 3, 8),
+    fused_lora_dys_dyb=LoRATritonConfig(64, None, 128, 8, 3, 8),
+    fused_lora_xw_sb_tma=LoRATritonConfig(128, 256, 64, 8, 3, 8),
+    fused_lora_dyw_dsa_tma=LoRATritonConfig(128, 256, 64, 8, 3, 8),
+    fused_multi_lora_block_size_m=128,
+    # fused_multi_lora_xw_sb=LoRATritonConfig(128, 256, 64, 8, 3, 8),
+    fused_multi_lora_xw_sb=LoRATritonConfig(128, 128, 64, 8, 3, 8),
+    fused_multi_lora_dyw_dsa=LoRATritonConfig(128, 128, 64, 8, 3, 8),
+    fused_multi_lora_dys_dyb=LoRATritonConfig(128, None, 64, 8, 3, 8),
+)
+
+H100_NVL_CONFIG = HardwareConfig(
+    fused_lora_xw_sb=LoRATritonConfig(128, 256, 64, 8, 3, 8),
+    fused_lora_dyw_dsa=LoRATritonConfig(128, 256, 64, 8, 3, 8),
+    fused_lora_dys_dyb=LoRATritonConfig(128, None, 128, 8, 3, 8),
+    fused_lora_xw_sb_tma=LoRATritonConfig(128, 256, 64, 8, 3, 8),
+    fused_lora_dyw_dsa_tma=LoRATritonConfig(128, 256, 64, 8, 3, 8),
+    fused_multi_lora_block_size_m=128,
+    fused_multi_lora_xw_sb=LoRATritonConfig(128, 256, 64, 8, 3, 8),
+    fused_multi_lora_dyw_dsa=LoRATritonConfig(128, 256, 64, 8, 3, 8),
+    fused_multi_lora_dys_dyb=LoRATritonConfig(128, None, 128, 8, 4, 8),
+)
+
+# RTX 5090 (Blackwell) - Using conservative RTX 3090 config as starting point
+# TODO: Run tools/tune_kernels.py to optimize for Blackwell architecture
+RTX5090_CONFIG = HardwareConfig(
+    fused_lora_xw_sb=LoRATritonConfig(64, 128, 32, 8, 4, 4),
+    fused_lora_xw_sb_tma=None,  # TMA not supported on Blackwell with current Triton
+    fused_lora_dyw_dsa=LoRATritonConfig(64, 128, 32, 8, 4, 4),
+    fused_lora_dyw_dsa_tma=None,
+    fused_lora_dys_dyb=LoRATritonConfig(64, None, 64, 8, 3, 4),
+    fused_multi_lora_block_size_m=64,
+    fused_multi_lora_xw_sb=LoRATritonConfig(64, 128, 32, 8, 4, 4),
+    fused_multi_lora_dyw_dsa=LoRATritonConfig(64, 128, 32, 8, 4, 4),
+    fused_multi_lora_dys_dyb=LoRATritonConfig(64, None, 64, 8, 3, 4),
+)
+
 HARDWARE_CONFIGS: dict[str, HardwareConfig] = {
     "h100-80gb-hbm3": H100_CONFIG,
+    "h100-nvl": H100_NVL_CONFIG,
     "a100-80gb-pcie": A100_80GB_PCIE_CONFIG,
     "a100-sxm4-80gb": A100_SXM4_80GB_CONFIG,
     "geforce-rtx-3090": RTX3090_CONFIG,
+    "geforce-rtx-5090": RTX5090_CONFIG,
+    "h200": H200_CONFIG,
 }
 
 

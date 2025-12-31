@@ -44,12 +44,18 @@ class TmaAutoTuneHelper:
         Args:
             None
         """
-        self.fill_1d_tma_descriptor_inner = (
-            triton.runtime.driver.active.utils.fill_1d_tma_descriptor
-        )
-        self.fill_2d_tma_descriptor_inner = (
-            triton.runtime.driver.active.utils.fill_2d_tma_descriptor
-        )
+        utils = triton.runtime.driver.active.utils
+        # Triton 3.6.0+ uses unified fill_tma_descriptor
+        # Triton 3.2.0 uses separate fill_1d/2d_tma_descriptor
+        if hasattr(utils, "fill_1d_tma_descriptor"):
+            self.fill_1d_tma_descriptor_inner = utils.fill_1d_tma_descriptor
+            self.fill_2d_tma_descriptor_inner = utils.fill_2d_tma_descriptor
+            self._use_unified_api = False
+        elif hasattr(utils, "fill_tma_descriptor"):
+            self.fill_tma_descriptor_inner = utils.fill_tma_descriptor
+            self._use_unified_api = True
+        else:
+            raise RuntimeError("No TMA descriptor API found in Triton")
         if HAS_TMA_DESC:
             self.descriptors = {}
         else:
@@ -85,15 +91,26 @@ class TmaAutoTuneHelper:
             if desc_x.data_ptr() % 64 != 0:
                 msg = "TMA descriptor is not 64-byte aligned. This may cause performance issues."
                 raise ValueError(msg)
-            self.fill_1d_tma_descriptor_inner(
-                ptr, dim, block_dim, element_size, desc_x.data_ptr()
-            )
+            if self._use_unified_api:
+                # Triton 3.6.0+ unified API - shape is a list
+                self.fill_tma_descriptor_inner(
+                    ptr, [dim], [block_dim], element_size, desc_x.data_ptr()
+                )
+            else:
+                self.fill_1d_tma_descriptor_inner(
+                    ptr, dim, block_dim, element_size, desc_x.data_ptr()
+                )
         else:
             desc_x = self.cuda_descriptors[name]
             buf_x = torch.empty_like(desc_x, device="cpu", pin_memory=True)
-            self.fill_1d_tma_descriptor_inner(
-                ptr, dim, block_dim, element_size, buf_x.data_ptr()
-            )
+            if self._use_unified_api:
+                self.fill_tma_descriptor_inner(
+                    ptr, [dim], [block_dim], element_size, buf_x.data_ptr()
+                )
+            else:
+                self.fill_1d_tma_descriptor_inner(
+                    ptr, dim, block_dim, element_size, buf_x.data_ptr()
+                )
             desc_x.copy_(buf_x, non_blocking=True)
 
     # Call this method inside the lambda function for grid size
@@ -119,15 +136,26 @@ class TmaAutoTuneHelper:
                     "This may cause performance issues."
                 )
                 raise ValueError(msg)
-            self.fill_2d_tma_descriptor_inner(
-                ptr, dim1, dim0, block_dim1, block_dim0, element_size, desc_x.data_ptr()
-            )
+            if self._use_unified_api:
+                # Triton 3.6.0+ unified API - shape is a list
+                self.fill_tma_descriptor_inner(
+                    ptr, [dim1, dim0], [block_dim1, block_dim0], element_size, desc_x.data_ptr()
+                )
+            else:
+                self.fill_2d_tma_descriptor_inner(
+                    ptr, dim1, dim0, block_dim1, block_dim0, element_size, desc_x.data_ptr()
+                )
         else:
             desc_x = self.cuda_descriptors[name]
             buf_x = torch.empty_like(desc_x, device="cpu", pin_memory=True)
-            self.fill_2d_tma_descriptor_inner(
-                ptr, dim1, dim0, block_dim1, block_dim0, element_size, buf_x.data_ptr()
-            )
+            if self._use_unified_api:
+                self.fill_tma_descriptor_inner(
+                    ptr, [dim1, dim0], [block_dim1, block_dim0], element_size, buf_x.data_ptr()
+                )
+            else:
+                self.fill_2d_tma_descriptor_inner(
+                    ptr, dim1, dim0, block_dim1, block_dim0, element_size, buf_x.data_ptr()
+                )
             desc_x.copy_(buf_x, non_blocking=True)
 
     def get_tma_descriptor_kernel_param(self, name) -> KernelParamWrapper:
@@ -170,5 +198,18 @@ def _compute_pid(
     return pid_m, pid_n
 
 
-tl_experimental_descriptor_load = tl._experimental_descriptor_load
-tl_experimental_descriptor_store = tl._experimental_descriptor_store
+# Triton API compatibility layer for different versions
+# Triton 3.2.0: tl._experimental_descriptor_load/store
+# Triton 3.6.0+: APIs renamed or moved
+if hasattr(tl, "_experimental_descriptor_load"):
+    tl_experimental_descriptor_load = tl._experimental_descriptor_load
+    tl_experimental_descriptor_store = tl._experimental_descriptor_store
+elif hasattr(tl, "load_tensor_descriptor"):
+    tl_experimental_descriptor_load = tl.load_tensor_descriptor
+    tl_experimental_descriptor_store = tl.store_tensor_descriptor
+else:
+    # Fallback: create dummy functions that raise error if called
+    def _not_available(*args, **kwargs):
+        raise RuntimeError("TMA descriptor operations not available in this Triton version")
+    tl_experimental_descriptor_load = _not_available
+    tl_experimental_descriptor_store = _not_available
