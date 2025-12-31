@@ -150,18 +150,19 @@ H100_NVL_CONFIG = HardwareConfig(
     fused_multi_lora_dys_dyb=LoRATritonConfig(128, None, 128, 8, 4, 8),
 )
 
-# RTX 5090 (Blackwell) - Using conservative RTX 3090 config as starting point
-# TODO: Run tools/tune_kernels.py to optimize for Blackwell architecture
+# RTX 5090 (Blackwell) - Auto-tuned configuration
+# Tuned on 2025-12-31 with M=4096, N=4096, K=4096, R=16, bfloat16
+# ~21% faster than PyTorch baseline for single LoRA kernels
 RTX5090_CONFIG = HardwareConfig(
-    fused_lora_xw_sb=LoRATritonConfig(64, 128, 32, 8, 4, 4),
-    fused_lora_xw_sb_tma=None,  # TMA not supported on Blackwell with current Triton
-    fused_lora_dyw_dsa=LoRATritonConfig(64, 128, 32, 8, 4, 4),
+    fused_lora_xw_sb=LoRATritonConfig(64, 64, 32, 16, 3, 4),      # 0.670ms vs 0.848ms PyTorch
+    fused_lora_xw_sb_tma=None,  # TMA not supported on Blackwell with Triton 3.6.0
+    fused_lora_dyw_dsa=LoRATritonConfig(64, 64, 64, 16, 3, 4),    # 0.671ms vs 0.848ms PyTorch
     fused_lora_dyw_dsa_tma=None,
-    fused_lora_dys_dyb=LoRATritonConfig(64, None, 64, 8, 3, 4),
+    fused_lora_dys_dyb=LoRATritonConfig(128, None, 128, 4, 8, 8), # 0.029ms
     fused_multi_lora_block_size_m=64,
-    fused_multi_lora_xw_sb=LoRATritonConfig(64, 128, 32, 8, 4, 4),
-    fused_multi_lora_dyw_dsa=LoRATritonConfig(64, 128, 32, 8, 4, 4),
-    fused_multi_lora_dys_dyb=LoRATritonConfig(64, None, 64, 8, 3, 4),
+    fused_multi_lora_xw_sb=LoRATritonConfig(64, 64, 64, 16, 3, 4),   # 0.861ms
+    fused_multi_lora_dyw_dsa=LoRATritonConfig(64, 64, 32, 4, 3, 8),  # 0.690ms vs 0.849ms PyTorch
+    fused_multi_lora_dys_dyb=LoRATritonConfig(64, None, 128, 16, 3, 8),  # 0.066ms
 )
 
 HARDWARE_CONFIGS: dict[str, HardwareConfig] = {
