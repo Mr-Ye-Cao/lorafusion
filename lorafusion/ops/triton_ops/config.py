@@ -130,6 +130,10 @@ HARDWARE_CONFIGS: dict[str, HardwareConfig] = {
     "a100-80gb-pcie": A100_80GB_PCIE_CONFIG,
     "a100-sxm4-80gb": A100_SXM4_80GB_CONFIG,
     "geforce-rtx-3090": RTX3090_CONFIG,
+    # RTX 5090 (Blackwell) - using RTX 3090 config as safer baseline
+    # H100 config uses too much shared memory (147456 > 101376 limit)
+    # TODO: Run tools/tune_kernels.py for optimal RTX 5090 configs
+    "geforce-rtx-5090": RTX3090_CONFIG,
 }
 
 

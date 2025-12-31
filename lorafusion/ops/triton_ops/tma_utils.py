@@ -7,6 +7,11 @@ import triton.language as tl
 
 HAS_TMA_DESC = "nv_tma_desc_type" in dir(tl)
 
+# Check for Triton TMA API availability (changed in Triton 3.6.0)
+_has_old_tma_api = hasattr(triton.runtime.driver.active.utils, 'fill_1d_tma_descriptor')
+_has_new_tma_api = hasattr(triton.runtime.driver.active.utils, 'fill_tma_descriptor')
+HAS_TMA_API = _has_old_tma_api or _has_new_tma_api
+
 
 class TmaAutoTuneHelper:
     """TMA Auto-Tune Helper.
@@ -44,12 +49,17 @@ class TmaAutoTuneHelper:
         Args:
             None
         """
-        self.fill_1d_tma_descriptor_inner = (
-            triton.runtime.driver.active.utils.fill_1d_tma_descriptor
-        )
-        self.fill_2d_tma_descriptor_inner = (
-            triton.runtime.driver.active.utils.fill_2d_tma_descriptor
-        )
+        utils = triton.runtime.driver.active.utils
+        if _has_old_tma_api:
+            # Triton 3.2.0 and earlier
+            self.fill_1d_tma_descriptor_inner = utils.fill_1d_tma_descriptor
+            self.fill_2d_tma_descriptor_inner = utils.fill_2d_tma_descriptor
+        elif _has_new_tma_api:
+            # Triton 3.6.0+ - use the new unified API
+            self.fill_1d_tma_descriptor_inner = utils.fill_tma_descriptor
+            self.fill_2d_tma_descriptor_inner = utils.fill_tma_descriptor
+        else:
+            raise RuntimeError("No TMA descriptor API found in Triton")
         if HAS_TMA_DESC:
             self.descriptors = {}
         else:
@@ -170,5 +180,12 @@ def _compute_pid(
     return pid_m, pid_n
 
 
-tl_experimental_descriptor_load = tl._experimental_descriptor_load
-tl_experimental_descriptor_store = tl._experimental_descriptor_store
+# Triton 3.6.0+ renamed these APIs
+if hasattr(tl, '_experimental_descriptor_load'):
+    # Triton 3.2.0 and earlier
+    tl_experimental_descriptor_load = tl._experimental_descriptor_load
+    tl_experimental_descriptor_store = tl._experimental_descriptor_store
+else:
+    # Triton 3.6.0+
+    tl_experimental_descriptor_load = tl.load_tensor_descriptor
+    tl_experimental_descriptor_store = tl.store_tensor_descriptor
