@@ -13,7 +13,7 @@ from lorafusion.ops.triton_ops.config import (
 )
 from lorafusion.ops.triton_ops.utils import torch_dtype_to_triton_dtype
 
-MAX_NUM_BLOCK_M_SIZE = 192  # max: MAX_NUM_BLOCK_M_SIZE * BLOCK_SIZE_M tokens
+MAX_NUM_BLOCK_M_SIZE = 512  # max: MAX_NUM_BLOCK_M_SIZE * BLOCK_SIZE_M tokens (increased for 8 adapters)
 GLOBAL_S_PTR_LIST = None
 GLOBAL_B_PTR_LIST = None
 

@@ -6,6 +6,7 @@ import triton
 import triton.language as tl
 from loguru import logger
 
+from lorafusion.ops.triton_ops.autotune_configs import get_matmul_autotune_configs
 from lorafusion.ops.triton_ops.config import (
     KERNEL_SPILL_VERBOSE,
     LoRATritonConfig,
@@ -13,7 +14,7 @@ from lorafusion.ops.triton_ops.config import (
 )
 from lorafusion.ops.triton_ops.utils import torch_dtype_to_triton_dtype
 
-MAX_NUM_BLOCK_M_SIZE = 192  # max: MAX_NUM_BLOCK_M_SIZE * BLOCK_SIZE_M tokens
+MAX_NUM_BLOCK_M_SIZE = 512  # max: MAX_NUM_BLOCK_M_SIZE * BLOCK_SIZE_M tokens (increased for 8 adapters)
 GLOBAL_S_PTR_LIST = None
 GLOBAL_B_PTR_LIST = None
 
@@ -150,9 +151,10 @@ def fused_multi_lora_xw_sb_kernel(  # noqa: PLR0915
     offs_r = tl.arange(0, MAX_R)
     offs_sm = (pid_m - s_offset_pid_m) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     s_ptrs = s_ptr + (offs_sm[:, None] * stride_sm + offs_r[None, :] * 1)
-    b_ptrs = b_ptr + (offs_r[:, None] * 1 + offs_wn[None, :] * r)
+    # b_ptrs = b_ptr + (offs_r[:, None] * 1 + offs_wn[None, :] * r)
+    b_ptrs = b_ptr + (offs_wn[None, :] * r) + (offs_r[:, None] * 1)
     s_mask = (tl.arange(0, BLOCK_SIZE_M)[:, None] < valid_size) & (offs_r[None, :] < r)
-    b_mask = offs_r[:, None] < r
+    b_mask = (offs_r[:, None] < r) & (offs_wn[None, :] < N)
 
     # ------------------------------------------------------------
     # 3. Compute the LoRA part
@@ -166,6 +168,8 @@ def fused_multi_lora_xw_sb_kernel(  # noqa: PLR0915
     # Compute LoRA contribution
     accum_main = tl.dot(s, b * alpha, accum_main)
 
+
+    
     # ------------------------------------------------------------
     # 4. Main loop
     # ------------------------------------------------------------
@@ -179,7 +183,7 @@ def fused_multi_lora_xw_sb_kernel(  # noqa: PLR0915
         x_mask = (tl.arange(0, BLOCK_SIZE_M)[:, None] < valid_size) & (
             offs_k[None, :] < K - k_offset
         )
-        w_mask = offs_k[:, None] < K - k_offset
+        w_mask = (offs_k[:, None] < K - k_offset) & (offs_wn[None, :] < N)
 
         # Load with proper masks
         x = tl.load(x_ptrs, mask=x_mask, other=0.0)
@@ -191,6 +195,7 @@ def fused_multi_lora_xw_sb_kernel(  # noqa: PLR0915
         # Advance the ptrs to the next K block.
         x_ptrs += BLOCK_SIZE_K * stride_xk
         w_ptrs += BLOCK_SIZE_K * stride_wk
+        
 
     # ------------------------------------------------------------
     # 5. Add bias if available
@@ -215,6 +220,14 @@ def fused_multi_lora_xw_sb_kernel(  # noqa: PLR0915
     out_mask = (tl.arange(0, BLOCK_SIZE_M)[:, None] < valid_size) & (
         offs_on[None, :] < N
     )
+    # NaN detection (accum_main != accum_main is True only for NaN values)
+    bad = accum_main != accum_main
+    nan_count = tl.sum(bad.to(tl.int32))
+    if nan_count > 0:
+        tl.device_print("NaN detected in tile pid=%d (pid_m=%d, pid_n=%d), count=%d", 
+                       tl.program_id(0), pid_m, pid_n, nan_count)
+
+
     tl.store(out_ptrs, accum_main, mask=out_mask)
 
 
@@ -290,7 +303,8 @@ def fused_multi_lora_xw_sb(
         bias_stride = bias.stride(0)
 
     # Allocates output.
-    if init_zeros:
+    # if init_zeros:
+    if True:
         # This is only for the testing purpose.
         out = torch.zeros((M, N), device=x.device, dtype=x.dtype)
     else:
@@ -336,4 +350,15 @@ def fused_multi_lora_xw_sb(
             f"n_spills: {compiled_kernel.n_spills}"
         )
         logger.warning(f"Compiled kernel.metadata: {compiled_kernel.metadata}")
+    nan_count = torch.sum(torch.isnan(out))
+    if nan_count > 0:
+        logger.error("NaN detected in fused_multi_lora_xw_sb output!")
+        logger.error(f"  NaN count: {nan_count.item()}/{out.numel()} elements")
+        logger.error(f"  x: shape={x.shape}, dtype={x.dtype}, has_nan={torch.isnan(x).any().item()}")
+        logger.error(f"  w: shape={w.shape}, dtype={w.dtype}, has_nan={torch.isnan(w).any().item()}")
+        if bias is not None and bias.numel() > 0:
+            logger.error(f"  bias: shape={bias.shape}, dtype={bias.dtype}, has_nan={torch.isnan(bias).any().item()}")
+        logger.error(f"  block_to_alpha: shape={block_to_alpha.shape}, min={block_to_alpha.min().item():.4f}, max={block_to_alpha.max().item():.4f}")
+        logger.error(f"  max_r: {max_r}, total_r: {total_r}")
+        raise ValueError(f"NaN detected in fused_multi_lora_xw_sb: {nan_count.item()}/{out.numel()} elements")
     return out

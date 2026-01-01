@@ -478,6 +478,7 @@ def _fused_linear_multi_lora_forward(
     torch.Tensor,
 ]:
     """Forward pass."""
+    torch.cuda.nvtx.range_push("Dropout Forward")
     if enable_dropout:
         if same_dropout_p_value is not None:
             masked_scaled_x, dropout_mask = seeded_dropout(
@@ -490,16 +491,21 @@ def _fused_linear_multi_lora_forward(
             masked_scaled_x, dropout_mask = blocked_seeded_dropout(
                 x=padded_x,
                 block_to_dropout_p=block_to_dropout_p,
-                block_size=get_lora_kernel_config("fused_multi_lora_block_size_m"),
+                block_size_m=get_lora_kernel_config("fused_multi_lora_block_size_m"),
                 seed=seed,
                 store_mask=True,
             )
     else:
         masked_scaled_x = padded_x
         dropout_mask = None
-
+    torch.cuda.nvtx.range_pop()
     # Calculate the s list for each block
-    full_s = padded_x @ (torch.cat(lora_a_list, dim=0).T)
+    torch.cuda.nvtx.range_push("S=XA Forward")
+    full_s = masked_scaled_x @ (torch.cat(lora_a_list, dim=0).T)  # X_hat @ A.T (dropout only on XAB path, not XW)
+    torch.cuda.nvtx.range_pop()
+    # padded_x: (total_seq_len, hidden_size)
+    # lora_a_list: list of (r, hidden_size)
+    # full_s: (total_seq_len, total_r)
     curr_m, curr_r = 0, 0
     s_list = []
     for padded_seq_len, lora_a_tensor in zip(
@@ -508,12 +514,21 @@ def _fused_linear_multi_lora_forward(
         lora_rank = lora_a_tensor.shape[0]
         s_list.append(
             full_s[curr_m : curr_m + padded_seq_len, curr_r : curr_r + lora_rank]
-        )
+        )   # take only the diagnal blocks
+        # TODO: check efficiency of this operation
         curr_m += padded_seq_len
         curr_r += lora_rank
 
     # s stride / total r dim
     total_r = full_s.shape[1]
+
+    # check s_list not nan
+    for s_tensor in s_list:
+        if torch.isnan(s_tensor).any():
+            msg = "s_list contains nan"
+            raise ValueError(msg)
+    
+    
 
     # Construct the s and b ptrs list
     s_ptrs_list, b_ptrs_list, _, _ = construct_s_and_b_ptrs_list(
@@ -522,8 +537,10 @@ def _fused_linear_multi_lora_forward(
         block_size_m=get_lora_kernel_config("fused_multi_lora_block_size_m"),
     )
 
+    torch.cuda.nvtx.range_push("XW+SB Forward")
+
     y = fused_multi_lora_xw_sb(
-        x=masked_scaled_x,
+        x=padded_x,  # do not dropout on XW path
         w=linear_w,
         s_ptrs_list=s_ptrs_list,
         b_ptrs_list=b_ptrs_list,
@@ -533,6 +550,7 @@ def _fused_linear_multi_lora_forward(
         total_r=total_r,
         bias=linear_bias,
     )
+    torch.cuda.nvtx.range_pop()
     return y, dropout_mask, masked_scaled_x, s_list, s_ptrs_list, b_ptrs_list
 
 
@@ -557,6 +575,7 @@ def _fused_linear_multi_lora_backward(
     requires_dx: bool = True,
 ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
     """Backward pass."""
+    torch.cuda.nvtx.range_push("XW+SB Backward")
     # Calculate db_list and ds_list using fused operation
     total_r = sum(lora_b.shape[1] for lora_b in lora_b_list if lora_b is not None)
     db_list, ds_list = fused_multi_lora_dys_dyb(
@@ -571,17 +590,20 @@ def _fused_linear_multi_lora_backward(
         total_r=total_r,
         block_size_m=get_lora_kernel_config("fused_multi_lora_block_size_m"),
     )
-
+    torch.cuda.nvtx.range_pop()
     # Calculate da_list from ds and masked_scaled_x
+    torch.cuda.nvtx.range_push("DA=DS.T @ X_hat Forward")
     da_list = []
     curr_m = 0
     for padded_seq_len, ds in zip(padded_seq_len_list, ds_list, strict=True):
         da = ds.T @ masked_scaled_x[curr_m : curr_m + padded_seq_len]
         da_list.append(da)
         curr_m += padded_seq_len
+    torch.cuda.nvtx.range_pop()
 
     # Calculate dx using fused operation
     if requires_dx:
+        torch.cuda.nvtx.range_push("DYW+DSA Forward")
         dx = fused_multi_lora_dyw_dsa(
             dy=dy,
             w=linear_w,
@@ -595,7 +617,7 @@ def _fused_linear_multi_lora_backward(
         )
     else:
         dx = None
-
+    torch.cuda.nvtx.range_pop()
     return dx, da_list, db_list, ds_list
 
 
@@ -611,10 +633,18 @@ class FusedLinearMultiLoRA(torch.autograd.Function):
         lora_a_1: torch.Tensor | None,
         lora_a_2: torch.Tensor | None,
         lora_a_3: torch.Tensor | None,
+        lora_a_4: torch.Tensor | None,
+        lora_a_5: torch.Tensor | None,
+        lora_a_6: torch.Tensor | None,
+        lora_a_7: torch.Tensor | None,
         lora_b_0: torch.Tensor | None,
         lora_b_1: torch.Tensor | None,
         lora_b_2: torch.Tensor | None,
         lora_b_3: torch.Tensor | None,
+        lora_b_4: torch.Tensor | None,
+        lora_b_5: torch.Tensor | None,
+        lora_b_6: torch.Tensor | None,
+        lora_b_7: torch.Tensor | None,
         seq_len_list: list[int],
         padded_seq_len_list: list[int],
         block_to_lookup_table: torch.Tensor,
@@ -627,6 +657,7 @@ class FusedLinearMultiLoRA(torch.autograd.Function):
         linear_bias: torch.Tensor | None,
     ) -> torch.Tensor:
         """Forward pass."""
+        torch.cuda.nvtx.range_push("FusedLinearMultiLoRA Forward")
         if seed is None:
             seed = random.randrange(int(1e6))  # noqa: S311
 
@@ -639,10 +670,10 @@ class FusedLinearMultiLoRA(torch.autograd.Function):
             msg = "currently, we only support batch size 1 for multi-linear LoRA"
             raise ValueError(msg)
 
-        padded_x = padded_x.reshape(seq_len, n)
+        padded_x = padded_x.reshape(seq_len, n)  # so confusing! 
 
-        lora_a_list = [lora_a_0, lora_a_1, lora_a_2, lora_a_3]
-        lora_b_list = [lora_b_0, lora_b_1, lora_b_2, lora_b_3]
+        lora_a_list = [lora_a_0, lora_a_1, lora_a_2, lora_a_3, lora_a_4, lora_a_5, lora_a_6, lora_a_7]
+        lora_b_list = [lora_b_0, lora_b_1, lora_b_2, lora_b_3, lora_b_4, lora_b_5, lora_b_6, lora_b_7]
         lora_a_list = [lora_a for lora_a in lora_a_list if lora_a is not None]
         lora_b_list = [lora_b for lora_b in lora_b_list if lora_b is not None]
 
@@ -683,6 +714,7 @@ class FusedLinearMultiLoRA(torch.autograd.Function):
         ctx.same_dropout_p_value = same_dropout_p_value
         ctx.max_r = max_r
         ctx.seed = seed
+        torch.cuda.nvtx.range_pop()
         return y.reshape(1, seq_len, -1)
 
     @staticmethod
@@ -691,6 +723,7 @@ class FusedLinearMultiLoRA(torch.autograd.Function):
         dy: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
         """Backward pass."""
+        torch.cuda.nvtx.range_push("FusedLinearMultiLoRA Backward")
         (
             masked_scaled_x,
             linear_w,
@@ -738,24 +771,26 @@ class FusedLinearMultiLoRA(torch.autograd.Function):
         if dx is not None:
             dx = dx.reshape(1, seq_len, -1)
 
-        da_list.extend([None] * (4 - len(da_list)))
-        db_list.extend([None] * (4 - len(db_list)))
+        da_list.extend([None] * (8 - len(da_list)))
+        db_list.extend([None] * (8 - len(db_list)))
+
+        torch.cuda.nvtx.range_pop()
 
         return (
             dx,
-            None,
-            *da_list,
-            *db_list,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            None,  # linear_w
+            *da_list,  # 8 items
+            *db_list,  # 8 items
+            None,  # seq_len_list
+            None,  # padded_seq_len_list
+            None,  # block_to_lookup_table
+            None,  # block_to_dropout_p
+            None,  # block_to_alpha
+            None,  # enable_dropout
+            None,  # same_dropout_p_value
+            None,  # max_r
+            None,  # seed
+            None,  # linear_bias
         )
 
 
@@ -800,10 +835,10 @@ def fused_linear_multi_lora(
     if len(lora_a_list) == 0:
         msg = "lora_a_list and lora_b_list must not be empty"
         raise ValueError(msg)
-    if len(lora_a_list) > 4:  # noqa: PLR2004
-        msg = "currently, we only support up to 4 simultaneous LoRA adapters"
+    if len(lora_a_list) > 8:  # noqa: PLR2004
+        msg = "currently, we only support up to 8 simultaneous LoRA adapters"
         raise ValueError(msg)
-    for _ in range(4 - len(lora_a_list)):
+    for _ in range(8 - len(lora_a_list)):
         lora_a_list.append(None)
         lora_b_list.append(None)
     return FusedLinearMultiLoRA.apply(
@@ -813,10 +848,18 @@ def fused_linear_multi_lora(
         lora_a_list[1],
         lora_a_list[2],
         lora_a_list[3],
+        lora_a_list[4],
+        lora_a_list[5],
+        lora_a_list[6],
+        lora_a_list[7],
         lora_b_list[0],
         lora_b_list[1],
         lora_b_list[2],
         lora_b_list[3],
+        lora_b_list[4],
+        lora_b_list[5],
+        lora_b_list[6],
+        lora_b_list[7],
         seq_len_list,
         padded_seq_len_list,
         block_to_lookup_table,
@@ -836,11 +879,18 @@ if __name__ == "__main__":
     hidden_size = 8192
     seed = 42
 
-    seq_len_list = [3072, 1024]
-    lora_idx_list = [0, 1]
-    lora_rank_list = [16, 16]
-    dropout_p_list = [0.1, 0.1]
-    alpha_list = [16.0, 16.0]
+    # seq_len_list = [3072, 1024]
+    # lora_idx_list = [0, 1]
+    # lora_rank_list = [16, 16]
+    # dropout_p_list = [0.1, 0.1]
+    # alpha_list = [16.0, 16.0]
+
+    seq_len_list = [624]
+    lora_idx_list = [0]
+    lora_rank_list = [16]
+    dropout_p_list = [0.05]
+    alpha_list = [32.0]
+
 
     multi_lora_batch_info = prepare_multi_lora_batch_info(
         seq_len_list=seq_len_list,
@@ -857,13 +907,23 @@ if __name__ == "__main__":
     enable_dropout = multi_lora_batch_info.enable_dropout
     same_dropout_p_value = multi_lora_batch_info.same_dropout_p_value
     max_r = multi_lora_batch_info.max_r
+    
+    print(f"padded_seq_len_list={padded_seq_len_list}")
+    print(f"block_to_lookup_table={block_to_lookup_table}")
+    print(f"block_to_dropout_p={block_to_dropout_p}")
+    print(f"block_to_alpha={block_to_alpha}")
+    print(f"enable_dropout={enable_dropout}")
+    print(f"same_dropout_p_value={same_dropout_p_value}")
+    print(f"max_r={max_r}")
 
     padded_x = torch.randn(
-        (1, sum(padded_seq_len_list), hidden_size),
+        # (1, sum(padded_seq_len_list), hidden_size),
+        (4, sum(padded_seq_len_list) // 4, hidden_size),
         dtype=torch.bfloat16,
         device="cuda",
         requires_grad=True,
     )
+    padded_x = padded_x.reshape(sum(padded_seq_len_list), hidden_size)
     linear_w = torch.randn(
         hidden_size, hidden_size, dtype=torch.bfloat16, device="cuda"
     )
@@ -913,7 +973,8 @@ if __name__ == "__main__":
                 )
 
             # Forward pass
-            full_s = padded_x @ (torch.cat(lora_a_list, dim=0).T)
+            # Use masked_scaled_x (with dropout applied) instead of padded_x
+            full_s = masked_scaled_x @ (torch.cat(lora_a_list, dim=0).T)
             curr_m, curr_r = 0, 0
             s_list = []
             for padded_seq_len, lora_a_tensor in zip(
@@ -976,7 +1037,7 @@ if __name__ == "__main__":
     test_fused_func = True
     if test_fused_func:
         y = fused_linear_multi_lora(
-            padded_x=padded_x,
+            padded_x=padded_x.unsqueeze(0),
             linear_w=linear_w,
             lora_a_list=lora_a_list,
             lora_b_list=lora_b_list,
@@ -990,4 +1051,5 @@ if __name__ == "__main__":
             max_r=max_r,
             linear_bias=None,
         )
+        print(f"y has nan: {torch.any(torch.isnan(y))}")
         y.sum().backward()
